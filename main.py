@@ -1,140 +1,229 @@
-from dash import Dash, dcc, html, Input, Output
+import dash
+from dash import Dash, dcc, html, Input, Output, State
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
 import plotly.express as px
 import plotly.graph_objects as go
-import pandas as pd
-from sklearn.cluster import KMeans
-import numpy as np
 
-# Load data
+# -------------------------------------------------------------------
+# 1. Load & prep
+# -------------------------------------------------------------------
 df = pd.read_csv('TNM098_Lab2/EyeTrack-raw.tsv', sep='\t')
+df = df.dropna(subset=['GazePointX(px)', 'GazePointY(px)', 'RecordingTimestamp'])
+df['point_id'] = np.arange(len(df))
 
-# Initialize app
+# Maximum marker size for scatter plots
+MAX_MARKER_SIZE = 30
+
+# -------------------------------------------------------------------
+# 2. App & layout
+# -------------------------------------------------------------------
 app = Dash(__name__)
 
-# App layout
-app.layout = html.Div(style={'display': 'flex', 'height': '100vh', 'padding': '10px'}, children=[
-
-    # Sidebar controls
-    html.Div(style={'width': '18%', 'paddingRight': '10px'}, children=[
-        html.P("Timestamp range (ms):", style={'fontSize': '12px', 'marginBottom': '4px'}),
-        dcc.RangeSlider(
-            id='range-slider',
-            min=0,
-            max=281000,
-            value=[0, 281000],
-            step=1000,
-            marks={0: '0', 100000: '100k', 200000: '200k', 281000: '281k'},
-            tooltip={"placement": "bottom", "always_visible": False}
+app.layout = html.Div(
+    style={'display': 'flex', 'height': '100vh', 'padding': '10px'},
+    children=[
+        # Sidebar controls
+        html.Div(
+            style={'width': '18%', 'paddingRight': '10px'},
+            children=[
+                html.P("Timestamp range (ms):", style={'fontSize': '12px'}),
+                dcc.RangeSlider(
+                    id='range-slider', min=0, max=281000, step=1000,
+                    marks={0: '0', 100000: '100k', 200000: '200k', 281000: '281k'},
+                    value=[0, 281000]
+                ),
+                html.Br(),
+                dcc.Checklist(
+                    id='cluster-toggle',
+                    options=[{'label': ' Show Clusters', 'value': 'enable'}],
+                    value=[]
+                ),
+                html.P("Number of clusters (≥700 ms):", style={'fontSize': '12px', 'marginTop': '10px'}),
+                dcc.Slider(
+                    id='cluster-count', min=1, max=5, step=1, value=3,
+                    marks={i: str(i) for i in range(1, 6)}
+                ),
+            ]
         ),
-        html.Br(),
-        html.P("Clustering options:", style={'fontSize': '12px', 'marginBottom': '4px'}),
-        dcc.Checklist(
-            id='cluster-toggle',
-            options=[{'label': ' Show Clusters', 'value': 'enable'}],
-            value=[],
-            style={'fontSize': '12px'}
-        ),
-        html.P("Number of Clusters \n (GeoSpatial + Duration > 700ms):", style={'fontSize': '12px', 'marginTop': '10px'}),
-        dcc.Slider(
-            id='cluster-count',
-            min=1,
-            max=5,
-            step=1,
-            value=3,
-            marks={i: str(i) for i in range(2, 11)},
-            tooltip={"placement": "bottom", "always_visible": False}
-        ),
-    ]),
 
-    # Graph area
-    html.Div(style={'width': '82%'}, children=[
-        html.Div([
-            dcc.Graph(id='graph-main', style={'height': '45%', 'width': '49%'}),
-            dcc.Graph(id='graph-cluster', style={'height': '45%', 'width': '49%'})
-        ], style={'display': 'flex', 'justifyContent': 'space-between'}),
-        dcc.Graph(id='graph-timeline', style={'height': '40%', 'marginTop': '10px'}),
-    ])
-])
+        # Stores for brush vs hover
+        dcc.Store(id='brush-ids', data=[]),
+        dcc.Store(id='hover-ids', data=[]),
 
-# Callback function for updating the graphs
-@app.callback(
-    Output('graph-main', 'figure'),
-    Output('graph-cluster', 'figure'),
-    Output('graph-timeline', 'figure'),
-    Input('range-slider', 'value'),
-    Input('cluster-toggle', 'value'),
-    Input('cluster-count', 'value')
+        # Graph area
+        html.Div(
+            style={'width': '82%'},
+            children=[
+                html.Div(
+                    style={'display': 'flex', 'justifyContent': 'space-between'},
+                    children=[
+                        dcc.Graph(id='main-graph', style={'width': '49%', 'height': '45%'}),
+                        dcc.Graph(id='cluster-graph', style={'width': '49%', 'height': '45%'})
+                    ]
+                ),
+                dcc.Graph(id='timeline-graph', style={'height': '40%', 'marginTop': '10px'})
+            ]
+        )
+    ]
 )
-def update_figure(selected_range, cluster_toggle, k):
-    low, high = selected_range
-    mask = (df['RecordingTimestamp'] >= low) & (df['RecordingTimestamp'] <= high)
-    filtered_df = df[mask].copy()
 
-    # Main scatter plot (eye tracking data with color based on timestamp)
-    fig_main = px.scatter(
-        filtered_df,
+# -------------------------------------------------------------------
+# 3. Callbacks for brush & hover
+# -------------------------------------------------------------------
+@app.callback(
+    Output('brush-ids', 'data'),
+    [
+        Input('main-graph', 'selectedData'),
+        Input('cluster-graph', 'selectedData'),
+        Input('timeline-graph', 'selectedData'),
+    ]
+)
+def update_brush(main_sel, cluster_sel, timeline_sel):
+    ids = set()
+    for ev in (main_sel, cluster_sel, timeline_sel):
+        if ev and 'points' in ev:
+            for pt in ev['points']:
+                pid = df.iloc[pt['pointIndex']]['point_id']
+                ids.add(int(pid))
+    return list(ids)
+
+@app.callback(
+    Output('hover-ids', 'data'),
+    [
+        Input('main-graph', 'hoverData'),
+        Input('cluster-graph', 'hoverData'),
+        Input('timeline-graph', 'hoverData'),
+    ]
+)
+def update_hover(main_hov, cluster_hov, timeline_hov):
+    ids = set()
+    for ev in (main_hov, cluster_hov, timeline_hov):
+        if ev and 'points' in ev:
+            for pt in ev['points']:
+                pid = df.iloc[pt['pointIndex']]['point_id']
+                ids.add(int(pid))
+    return list(ids)
+
+# -------------------------------------------------------------------
+# 4. Helper for scatter with capped point sizes and highlighting
+# -------------------------------------------------------------------
+def make_scatter(df, x, y, size=None, color=None, title="", highlight_ids=None, color_continuous_scale=None):
+    fig = px.scatter(
+        df,
+        x=x,
+        y=y,
+        size=size,
+        color=color,
+        size_max=MAX_MARKER_SIZE,
+        title=title,
+        color_continuous_scale=color_continuous_scale
+    )
+    if highlight_ids is not None:
+        fig.update_traces(
+            selectedpoints=highlight_ids,
+            unselected=dict(marker=dict(opacity=0.7)),
+            selected=dict(marker=dict(opacity=1, size=MAX_MARKER_SIZE, color='red'))
+        )
+    return fig
+
+# -------------------------------------------------------------------
+# 5. Main redraw callback
+# -------------------------------------------------------------------
+@app.callback(
+    Output('main-graph', 'figure'),
+    Output('cluster-graph', 'figure'),
+    Output('timeline-graph', 'figure'),
+    [
+        Input('range-slider', 'value'),
+        Input('cluster-toggle', 'value'),
+        Input('cluster-count', 'value'),
+        Input('brush-ids', 'data'),
+        Input('hover-ids', 'data')
+    ]
+)
+def update_all(ts_range, cluster_toggle, k, brush_ids, hover_ids):
+    low, high = ts_range
+    dff = df[(df['RecordingTimestamp'] >= low) & (df['RecordingTimestamp'] <= high)]
+
+    # determine which points to highlight
+    highlight = sorted(set(brush_ids or []) | set(hover_ids or []))
+
+    # Main graph (time → color)
+    fig_main = make_scatter(
+        dff,
         x='GazePointX(px)',
         y='GazePointY(px)',
         size='GazeEventDuration(mS)',
-        opacity=0.6,
-        color='RecordingTimestamp',  # Color based on timestamp
-        color_continuous_scale='Viridis',
-        range_color=[0, 281000],
-        title='Eye Tracking Data'
+        color='RecordingTimestamp',
+        title="Eye Tracking Overview",
+        highlight_ids=highlight,
+        color_continuous_scale='viridis'
     )
 
-    # Default empty cluster and timeline plots
-    fig_cluster = px.scatter(title="Clustering not enabled.")
-    fig_timeline = px.scatter(title="Clustering not enabled.")
+    # default placeholders
+    fig_cluster = go.Figure().add_annotation(text="Clustering disabled", showarrow=False)
+    fig_timeline = go.Figure().add_annotation(text="Clustering disabled", showarrow=False)
 
-    if 'enable' in cluster_toggle and not filtered_df.empty:
-        # Filter valid gaze points with a minimum duration of 700ms
-        valid = filtered_df[
-            (filtered_df['GazeEventDuration(mS)'] >= 700)
-        ][['RecordingTimestamp', 'GazePointX(px)', 'GazePointY(px)']].dropna()
-
+    # If clustering is enabled
+    if 'enable' in cluster_toggle:
+        valid = dff[dff['GazeEventDuration(mS)'] >= 700].copy()
         if len(valid) >= k:
-            # Perform clustering only based on spatial coordinate proximity
-            kmeans = KMeans(n_clusters=k, random_state=0)
-            clusters = kmeans.fit_predict(valid[['GazePointX(px)', 'GazePointY(px)']])
-
-            # Assign clusters back to the original dataframe
-            filtered_df.loc[valid.index, 'Cluster'] = clusters
-
-            # Mark unclustered points with NaN (they'll be assigned a low opacity)
-            filtered_df['Cluster'].fillna(-1, inplace=True)
-
-            # Set opacity for points: clustered points will have higher opacity, unclustered will be dimmed
-            filtered_df['opacity'] = np.where(filtered_df['Cluster'] == -1, 0.1, 0.85)
-
-            # Clustered points scatter plot
-            fig_cluster = px.scatter(
-                filtered_df,
-                x='GazePointX(px)',
-                y='GazePointY(px)',
-                size='GazeEventDuration(mS)',
-                opacity=filtered_df['opacity'],
-                color='Cluster',  # Color based on cluster id
-                color_discrete_map={i: px.colors.qualitative.Set1[i] for i in range(k)},  # Set distinct colors for clusters
-                title=f'Cluster View'
+            valid['cluster'] = KMeans(n_clusters=k, random_state=0).fit_predict(
+                valid[['GazePointX(px)', 'GazePointY(px)']]
             )
-
-            # Cluster timeline plot
-            fig_timeline = px.scatter(
-                filtered_df,
-                x='RecordingTimestamp',
-                y='Cluster',
-                color='Cluster',  # Color based on cluster id
-                size='GazeEventDuration(mS)',
-                color_discrete_map={i: px.colors.qualitative.Set1[i] for i in range(k)},  # Set distinct colors for clusters
-                title='Cluster Timeline',
-                labels={'RecordingTimestamp': 'Time (ms)', 'Cluster': 'Cluster ID'}
-            )
+            dff = dff.merge(valid[['point_id', 'cluster']], on='point_id', how='left')
         else:
-            fig_cluster = px.scatter(title="Not enough data for clustering.")
-            fig_timeline = px.scatter(title="Not enough data for clustering.")
+            dff['cluster'] = -1
+
+        # Cluster view: build, then tweak each trace individually
+        fig_cluster = px.scatter(
+            dff,
+            x='GazePointX(px)',
+            y='GazePointY(px)',
+            size='GazeEventDuration(mS)',
+            color='cluster',
+            size_max=MAX_MARKER_SIZE,
+            title="Cluster View"
+        )
+        for trace in fig_cluster.data:
+            # if cluster is nan - lower opacity
+            if trace.name == 'NaN':
+                trace.update(
+                    marker=dict(opacity=0.1),
+                    selectedpoints=highlight,
+                    unselected=dict(marker=dict(opacity=0.1)),
+                    selected=dict(marker=dict(opacity=1, size=MAX_MARKER_SIZE, color='red'))
+                )
+            else:
+                # clustered = normal base, dim when unselected
+                trace.update(
+                    marker=dict(opacity=0.7),
+                    selectedpoints=highlight,
+                    unselected=dict(marker=dict(opacity=0.7)),
+                    selected=dict(marker=dict(opacity=1, size=MAX_MARKER_SIZE, color='red'))
+                )
+
+        # Timeline view: same capped size & styling
+        fig_timeline = px.scatter(
+            dff,
+            x='RecordingTimestamp',
+            y='cluster',
+            size='GazeEventDuration(mS)',
+            color='cluster',
+            size_max=MAX_MARKER_SIZE,
+            title="Cluster Timeline"
+        )
+        fig_timeline.update_traces(
+            selectedpoints=highlight,
+            unselected=dict(marker=dict(opacity=0.7)),
+            selected=dict(marker=dict(opacity=1, size=MAX_MARKER_SIZE, color='red'))
+        )
 
     return fig_main, fig_cluster, fig_timeline
 
-# Run app
+# -------------------------------------------------------------------
+# 6. Run server
+# -------------------------------------------------------------------
 app.run(debug=True)
