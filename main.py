@@ -177,4 +177,5 @@ def update_figure(selected_range, cluster_toggle, k, brush_ids, hover_ids, show_
 
     return fig_main, fig_cluster, fig_timeline
 
+# Run the app
 app.run(debug=True)
